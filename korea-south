@@ -1,0 +1,260 @@
+----- resources.tf--------
+resource "azurerm_resource_group" "user02-rgs" {
+    name     = "user02rg"
+    location = "koreasouth"
+
+    tags = {
+        environment = "Terraform Demo"
+    }
+}
+
+---------- myVnets.tf
+resource "azurerm_virtual_network" "user02-vnets" {
+	name 			= "user02-myVnets"
+	address_space 		= ["102.0.0.0/16"]
+	location 			= azurerm_resource_group.user02-rgs.location
+	resource_group_name	= azurerm_resource_group.user02-rgs.name
+}
+
+----------- mySubnets.tf
+resource "azurerm_subnet" "user02-subnet2" {
+    name = "user02-mysubnet2"
+    resource_group_name = azurerm_resource_group.user02-rgs.name
+    virtual_network_name = azurerm_virtual_network.user02-vnets.name
+    address_prefixes = ["102.0.1.0/24"]
+}
+
+------- public_ips.tf
+resource "azurerm_public_ip" "user02-publicips" {  
+name                = "mypublicIPs"  
+location            = azurerm_resource_group.user02-rgs.location  
+resource_group_name = azurerm_resource_group.user02-rgs.name  
+allocation_method   = "Static"  
+domain_name_label   = azurerm_resource_group.user02-rgs.name  
+	
+## Resource Group 이름에 대문자를 쓰면 에러 발생 (so, 리소스 그룹은 소문자로 생성)
+## 동일 Region에 추가 Public IP 생성시에는 기존 Public IP와 다른 이름을 할당해야 함으로 아래처럼 직접 입력해도 됨
+# domain_name_label   = "user02pubip2"
+
+	tags = {    
+		environment = "staging"  
+	}
+
+}
+
+----- myNetworkSecurityGroups.tf
+resource "azurerm_network_security_group" "user02nsgs" {
+    name                = "user02nsgs"
+    location            = azurerm_resource_group.user02-rgs.location
+    resource_group_name = azurerm_resource_group.user02-rgs.name
+    
+    security_rule {
+        name                       = "SSH"
+        priority                   = 1001
+        direction                  = "Inbound"
+        access                     = "Allow"
+        protocol                   = "Tcp"
+        source_port_range          = "*"
+        destination_port_range     = "22"
+        source_address_prefix      = "*"
+        destination_address_prefix = "*"
+    }
+ security_rule {
+        name                       = "HTTP"
+        priority                   = 2001
+        direction                  = "Inbound"
+        access                     = "Allow"
+        protocol                   = "Tcp"
+        source_port_range          = "*"
+        destination_port_range     = "80"
+        source_address_prefix      = "*"
+        destination_address_prefix = "*"
+    }
+
+    tags = {
+        environment = "Terraform Demo"
+    }
+}
+
+--- lbs.tf
+resource "azurerm_lb" "user02-lbs" {
+  name                    = "user02lbs"
+  location                = azurerm_resource_group.user02-rgs.location
+  resource_group_name     = azurerm_resource_group.user02-rgs.name
+  
+  frontend_ip_configuration {
+    name                  = "user02sPublicIPAddress"
+    public_ip_address_id   = azurerm_public_ip.user02-publicips.id
+  }
+}
+
+----- lb_backendpools.tf
+resource "azurerm_lb_backend_address_pool" "user02-bpepools" {
+    name = "user02-BackEndAddressPools"
+    resource_group_name = azurerm_resource_group.user02-rgs.name
+    loadbalancer_id     = azurerm_lb.user02-lbs.id
+}
+
+---- lb_natpool.tf
+resource "azurerm_lb_nat_pool" "lbnatpools" {
+    resource_group_name = azurerm_resource_group.user02-rgs.name
+    name = "ssh"
+    loadbalancer_id = azurerm_lb.user02-lbs.id
+    protocol = "Tcp"
+    frontend_port_start = 50000
+    frontend_port_end = 50119
+    backend_port = 22
+    frontend_ip_configuration_name = "user02sPublicIPAddress"
+}
+
+---------- lb_probe.tf
+resource "azurerm_lb_probe" "user02-lb-probes" {
+    resource_group_name = azurerm_resource_group.user02-rgs.name
+    loadbalancer_id = azurerm_lb.user02-lbs.id
+    name = "http-probe"
+    protocol = "Http"
+    request_path = "/"
+    port = 80
+}
+
+----- lb_rule.tf
+resource "azurerm_lb_rule" "lbnatrules" {
+    resource_group_name = azurerm_resource_group.user02-rgs.name
+    loadbalancer_id = azurerm_lb.user02-lbs.id
+    name = "http"
+    protocol = "Tcp"
+    frontend_port = 80
+    backend_port = 80
+    backend_address_pool_id = azurerm_lb_backend_address_pool.user02-bpepools.id
+    frontend_ip_configuration_name = "user02sPublicIPAddress"
+    probe_id = azurerm_lb_probe.user02-lb-probes.id
+}
+
+-------------vmss2.tf-----------
+resource "azurerm_virtual_machine_scale_set" "user02svmss" {
+name = "user02svmss"
+location = azurerm_resource_group.user02-rgs.location
+resource_group_name = azurerm_resource_group.user02-rgs.name
+
+upgrade_policy_mode = "Manual"
+
+sku {
+    name = "Standard_D2_v3"
+    tier = "Standard"
+    capacity = 2
+}
+storage_profile_image_reference {
+    publisher = "Canonical"
+    offer = "UbuntuServer"
+    sku = "18.04-LTS"
+    version = "latest"
+}
+
+storage_profile_os_disk {
+    name = "user02spod"
+    caching = "ReadWrite"
+    create_option = "FromImage"
+    managed_disk_type = "Standard_LRS"
+}
+storage_profile_data_disk {
+    lun = 0
+    caching = "ReadWrite"
+    create_option = "Empty"
+    disk_size_gb = 10
+}
+os_profile {
+    computer_name_prefix = "testvm"
+    admin_username = "user02"  ## VM 에 접속할 계정
+    custom_data = file("web.sh")
+}
+
+os_profile_linux_config {
+disable_password_authentication = true
+ssh_keys {
+    path = "/home/user02/.ssh/authorized_keys"   ## pwd 실행후 경로설정 ex) /home/user01 등 
+    key_data = file("~/.ssh/id_rsa.pub")  ## Public Key는 VMSS 실행 전에 미리 터미널에서 ssh-keygen 으로 생성 (엔터 3번) 
+    }
+}
+    
+network_profile {
+        name = "terraformnetworkprofile"
+        primary = true
+        ip_configuration {
+        name = "TestIPConfiguration"
+        primary = true
+        subnet_id = azurerm_subnet.user02-subnet2.id
+        load_balancer_backend_address_pool_ids = [azurerm_lb_backend_address_pool.user02-bpepools.id]
+        load_balancer_inbound_nat_rules_ids = [azurerm_lb_nat_pool.lbnatpools.id]
+    }
+        network_security_group_id = azurerm_network_security_group.user02nsgs.id
+}
+tags = {
+    environment = "staging"
+    }
+}
+
+-----------auto scaling : vmss > 확장 중-------------
+resource "azurerm_monitor_autoscale_setting" "user02-as2" {
+  name                = "user02-as2"
+  resource_group_name = azurerm_resource_group.user02-rgs.name
+  location            = azurerm_resource_group.user02-rgs.location
+  target_resource_id  = azurerm_virtual_machine_scale_set.user02svmss.id
+
+  profile {
+    name = "defaultProfile"
+
+    capacity {
+      default = 2
+      minimum = 1
+      maximum = 3
+    }
+
+    rule {
+      metric_trigger {
+        metric_name        = "Percentage CPU"
+        metric_resource_id = azurerm_virtual_machine_scale_set.user02svmss.id
+        time_grain         = "PT1M"
+        statistic          = "Average"
+        time_window        = "PT5M"
+        time_aggregation   = "Average"
+        operator           = "GreaterThan"
+        threshold          = 75
+      }
+
+      scale_action {
+        direction = "Increase"
+        type      = "ChangeCount"
+        value     = "1"
+        cooldown  = "PT1M"
+      }
+    }
+
+    rule {
+      metric_trigger {
+        metric_name        = "Percentage CPU"
+        metric_resource_id = azurerm_virtual_machine_scale_set.user02svmss.id
+        time_grain         = "PT1M"
+        statistic          = "Average"
+        time_window        = "PT5M"
+        time_aggregation   = "Average"
+        operator           = "LessThan"
+        threshold          = 25
+      }
+
+      scale_action {
+        direction = "Decrease"
+        type      = "ChangeCount"
+        value     = "1"
+        cooldown  = "PT1M"
+      }
+    }
+  }
+
+  notification {
+    email {
+      send_to_subscription_administrator    = true
+      send_to_subscription_co_administrator = true
+      custom_emails                         = ["kny19@sk.com"]
+    }
+  }
+}
